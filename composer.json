@@ -31,10 +31,13 @@
         "psr/log": "^1|^2|^3"
     },
     "autoload": {
-        "psr-4": { "Symfony\\Component\\Security\\Acl\\": "" },
+        "psr-4": { "Symfony\\Component\\Security\\Acl\\": "Classes/" },
         "exclude-from-classmap": [
             "/Tests/"
         ]
+    },
+    "autoload-dev": {
+        "psr-4": { "Symfony\\Component\\Security\\Acl\\Tests\\": "Tests/" }
     },
     "conflict": {
         "doctrine/cache": "<1.11",
