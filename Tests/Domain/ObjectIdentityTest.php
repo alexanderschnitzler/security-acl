@@ -36,7 +36,7 @@ namespace Symfony\Component\Security\Acl\Tests\Domain
         public function testFromDomainObjectPrefersInterfaceOverGetId()
         {
             $domainObject = new class() implements DomainObjectInterface {
-                public function getObjectIdentifier()
+                public function getObjectIdentifier(): string
                 {
                     return 'getObjectIdentifier()';
                 }
