@@ -14,6 +14,8 @@ declare(strict_types=1);
 namespace Symfony\Component\Security\Acl\Dbal;
 
 use Doctrine\DBAL\Connection;
+use Doctrine\DBAL\ParameterType;
+use Doctrine\DBAL\Statement;
 use Doctrine\Persistence\PropertyChangedListener;
 use Symfony\Component\Security\Acl\Domain\Acl;
 use Symfony\Component\Security\Acl\Domain\Entry;
@@ -62,7 +64,11 @@ class MutableAclProvider extends AclProvider implements MutableAclProviderInterf
             $this->createObjectIdentity($oid);
 
             $pk = $this->retrieveObjectIdentityPrimaryKey($oid);
-            $this->connection->executeStatement($this->getInsertObjectIdentityRelationSql($pk, $pk));
+
+            $statement = $this->getInsertObjectIdentityRelationSql();
+            $statement->bindValue(':object_identity_id', $pk, ParameterType::INTEGER);
+            $statement->bindValue(':ancestor_id', $pk, ParameterType::INTEGER);
+            $statement->executeStatement();
 
             $this->connection->commit();
         } catch (\Exception $e) {
@@ -119,7 +125,20 @@ class MutableAclProvider extends AclProvider implements MutableAclProviderInterf
      */
     public function deleteSecurityIdentity(SecurityIdentityInterface $sid): void
     {
-        $this->connection->executeStatement($this->getDeleteSecurityIdentityIdSql($sid));
+        if ($sid instanceof UserSecurityIdentity) {
+            $identifier = $sid->getClass().'-'.$sid->getUsername();
+            $username = true;
+        } elseif ($sid instanceof RoleSecurityIdentity) {
+            $identifier = $sid->getRole();
+            $username = false;
+        } else {
+            throw new \InvalidArgumentException('$sid must either be an instance of UserSecurityIdentity, or RoleSecurityIdentity.');
+        }
+
+        $deleteSecurityIdentityIdStatement = $this->getDeleteSecurityIdentityIdSql();
+        $deleteSecurityIdentityIdStatement->bindValue(':identifier', $identifier);
+        $deleteSecurityIdentityIdStatement->bindValue(':username', $username, ParameterType::BOOLEAN);
+        $deleteSecurityIdentityIdStatement->executeStatement();
     }
 
     /**
@@ -244,14 +263,26 @@ class MutableAclProvider extends AclProvider implements MutableAclProviderInterf
         $this->connection->beginTransaction();
         try {
             if (isset($propertyChanges['entriesInheriting'])) {
-                $sets[] = 'entries_inheriting = '.$this->connection->getDatabasePlatform()->convertBooleans($propertyChanges['entriesInheriting'][1]);
+                $sets[] = [
+                    'key' => 'entries_inheriting',
+                    'value' => $propertyChanges['entriesInheriting'][1],
+                    'type' => ParameterType::BOOLEAN,
+                ];
             }
 
             if (isset($propertyChanges['parentAcl'])) {
                 if (null === $propertyChanges['parentAcl'][1]) {
-                    $sets[] = 'parent_object_identity_id = NULL';
+                    $sets[] = [
+                        'key' => 'parent_object_identity_id',
+                        'value' => null,
+                        'type' => ParameterType::NULL,
+                    ];
                 } else {
-                    $sets[] = 'parent_object_identity_id = '.(int) $propertyChanges['parentAcl'][1]->getId();
+                    $sets[] = [
+                        'key' => 'parent_object_identity_id',
+                        'value' => (int) $propertyChanges['parentAcl'][1]->getId(),
+                        'type' => ParameterType::INTEGER,
+                    ];
                 }
 
                 $this->regenerateAncestorRelations($acl);
@@ -329,7 +360,14 @@ class MutableAclProvider extends AclProvider implements MutableAclProviderInterf
 
             // persist any changes to the acl_object_identities table
             if (\count($sets) > 0) {
-                $this->connection->executeStatement($this->getUpdateObjectIdentitySql($acl->getId(), $sets));
+                $statement = $this->getUpdateObjectIdentitySql(array_column($sets, 'key'));
+                $statement->bindValue('id', $acl->getId());
+
+                foreach ($sets as $set) {
+                    $statement->bindValue(':'.$set['key'], $set['value'], $set['type']);
+                }
+
+                $statement->executeStatement();
             }
 
             $this->connection->commit();
@@ -365,259 +403,6 @@ class MutableAclProvider extends AclProvider implements MutableAclProviderInterf
      */
     public function updateUserSecurityIdentity(UserSecurityIdentity $usid, string $oldUsername): void
     {
-        $this->connection->executeStatement($this->getUpdateUserSecurityIdentitySql($usid, $oldUsername));
-    }
-
-    /**
-     * Constructs the SQL for deleting access control entries.
-     */
-    protected function getDeleteAccessControlEntriesSql(int $oidPK): string
-    {
-        return sprintf(
-            'DELETE FROM %s WHERE object_identity_id = %d',
-            $this->options['entry_table_name'],
-            $oidPK
-        );
-    }
-
-    /**
-     * Constructs the SQL for deleting a specific ACE.
-     */
-    protected function getDeleteAccessControlEntrySql(int $acePK): string
-    {
-        return sprintf(
-            'DELETE FROM %s WHERE id = %d',
-            $this->options['entry_table_name'],
-            $acePK
-        );
-    }
-
-    /**
-     * Constructs the SQL for deleting an object identity.
-     */
-    protected function getDeleteObjectIdentitySql(int $pk): string
-    {
-        return sprintf(
-            'DELETE FROM %s WHERE id = %d',
-            $this->options['oid_table_name'],
-            $pk
-        );
-    }
-
-    /**
-     * Constructs the SQL for deleting relation entries.
-     */
-    protected function getDeleteObjectIdentityRelationsSql(int $pk): string
-    {
-        return sprintf(
-            'DELETE FROM %s WHERE object_identity_id = %d',
-            $this->options['oid_ancestors_table_name'],
-            $pk
-        );
-    }
-
-    /**
-     * Constructs the SQL for inserting an ACE.
-     */
-    protected function getInsertAccessControlEntrySql(int $classId, ?int $objectIdentityId, ?string $field, int $aceOrder, int $securityIdentityId, string $strategy, int $mask, bool $granting, bool $auditSuccess, bool $auditFailure): string
-    {
-        $query = <<<QUERY
-            INSERT INTO %s (
-                class_id,
-                object_identity_id,
-                field_name,
-                ace_order,
-                security_identity_id,
-                mask,
-                granting,
-                granting_strategy,
-                audit_success,
-                audit_failure
-            )
-            VALUES (%d, %s, %s, %d, %d, %d, %s, %s, %s, %s)
-QUERY;
-
-        return sprintf(
-            $query,
-            $this->options['entry_table_name'],
-            $classId,
-            null === $objectIdentityId ? 'NULL' : (int) $objectIdentityId,
-            null === $field ? 'NULL' : $this->connection->quote($field),
-            $aceOrder,
-            $securityIdentityId,
-            $mask,
-            $this->connection->getDatabasePlatform()->convertBooleans($granting),
-            $this->connection->quote($strategy),
-            $this->connection->getDatabasePlatform()->convertBooleans($auditSuccess),
-            $this->connection->getDatabasePlatform()->convertBooleans($auditFailure)
-        );
-    }
-
-    /**
-     * Constructs the SQL for inserting a new class type.
-     */
-    protected function getInsertClassSql(string $classType): string
-    {
-        return sprintf(
-            'INSERT INTO %s (class_type) VALUES (%s)',
-            $this->options['class_table_name'],
-            $this->connection->quote($classType)
-        );
-    }
-
-    /**
-     * Constructs the SQL for inserting a relation entry.
-     */
-    protected function getInsertObjectIdentityRelationSql(int $objectIdentityId, int $ancestorId): string
-    {
-        return sprintf(
-            'INSERT INTO %s (object_identity_id, ancestor_id) VALUES (%d, %d)',
-            $this->options['oid_ancestors_table_name'],
-            $objectIdentityId,
-            $ancestorId
-        );
-    }
-
-    /**
-     * Constructs the SQL for inserting an object identity.
-     */
-    protected function getInsertObjectIdentitySql(string $identifier, int $classId, bool $entriesInheriting): string
-    {
-        $query = <<<QUERY
-              INSERT INTO %s (class_id, object_identifier, entries_inheriting)
-              VALUES (%d, %s, %s)
-QUERY;
-
-        return sprintf(
-            $query,
-            $this->options['oid_table_name'],
-            $classId,
-            $this->connection->quote($identifier),
-            $this->connection->getDatabasePlatform()->convertBooleans($entriesInheriting)
-        );
-    }
-
-    /**
-     * Constructs the SQL for inserting a security identity.
-     *
-     * @throws \InvalidArgumentException
-     */
-    protected function getInsertSecurityIdentitySql(SecurityIdentityInterface $sid): string
-    {
-        if ($sid instanceof UserSecurityIdentity) {
-            $identifier = $sid->getClass().'-'.$sid->getUsername();
-            $username = true;
-        } elseif ($sid instanceof RoleSecurityIdentity) {
-            $identifier = $sid->getRole();
-            $username = false;
-        } else {
-            throw new \InvalidArgumentException('$sid must either be an instance of UserSecurityIdentity, or RoleSecurityIdentity.');
-        }
-
-        return sprintf(
-            'INSERT INTO %s (identifier, username) VALUES (%s, %s)',
-            $this->options['sid_table_name'],
-            $this->connection->quote($identifier),
-            $this->connection->getDatabasePlatform()->convertBooleans($username)
-        );
-    }
-
-    /**
-     * Constructs the SQL for selecting an ACE.
-     */
-    protected function getSelectAccessControlEntryIdSql(int $classId, ?int $oid, ?string $field, int $order): string
-    {
-        return sprintf(
-            'SELECT id FROM %s WHERE class_id = %d AND object_identity_id %s AND field_name %s AND ace_order = %d',
-            $this->options['entry_table_name'],
-            $classId,
-            null === $oid
-                ? 'IS NULL'
-                : '= '.(int) $oid,
-            null === $field
-                ? 'IS NULL'
-                : '= '.$this->connection->quote($field),
-            $order
-        );
-    }
-
-    /**
-     * Constructs the SQL for selecting the primary key associated with
-     * the passed class type.
-     */
-    protected function getSelectClassIdSql(string $classType): string
-    {
-        return sprintf(
-            'SELECT id FROM %s WHERE class_type = %s',
-            $this->options['class_table_name'],
-            $this->connection->quote($classType)
-        );
-    }
-
-    /**
-     * Constructs the SQL for selecting the primary key of a security identity.
-     *
-     * @throws \InvalidArgumentException
-     */
-    protected function getSelectSecurityIdentityIdSql(SecurityIdentityInterface $sid): string
-    {
-        if ($sid instanceof UserSecurityIdentity) {
-            $identifier = $sid->getClass().'-'.$sid->getUsername();
-            $username = true;
-        } elseif ($sid instanceof RoleSecurityIdentity) {
-            $identifier = $sid->getRole();
-            $username = false;
-        } else {
-            throw new \InvalidArgumentException('$sid must either be an instance of UserSecurityIdentity, or RoleSecurityIdentity.');
-        }
-
-        return sprintf(
-            'SELECT id FROM %s WHERE identifier = %s AND username = %s',
-            $this->options['sid_table_name'],
-            $this->connection->quote($identifier),
-            $this->connection->getDatabasePlatform()->convertBooleans($username)
-        );
-    }
-
-    /**
-     * Constructs the SQL to delete a security identity.
-     *
-     * @throws \InvalidArgumentException
-     */
-    protected function getDeleteSecurityIdentityIdSql(SecurityIdentityInterface $sid): string
-    {
-        $select = $this->getSelectSecurityIdentityIdSql($sid);
-        $delete = preg_replace('/^SELECT id FROM/', 'DELETE FROM', $select);
-
-        return $delete;
-    }
-
-    /**
-     * Constructs the SQL for updating an object identity.
-     *
-     * @param array<int,string> $changes
-     *
-     * @throws \InvalidArgumentException
-     */
-    protected function getUpdateObjectIdentitySql(int $pk, array $changes): string
-    {
-        if (0 === \count($changes)) {
-            throw new \InvalidArgumentException('There are no changes.');
-        }
-
-        return sprintf(
-            'UPDATE %s SET %s WHERE id = %d',
-            $this->options['oid_table_name'],
-            implode(', ', $changes),
-            $pk
-        );
-    }
-
-    /**
-     * Constructs the SQL for updating a user security identity.
-     */
-    protected function getUpdateUserSecurityIdentitySql(UserSecurityIdentity $usid, string $oldUsername): string
-    {
         if ($usid->getUsername() == $oldUsername) {
             throw new \InvalidArgumentException('There are no changes.');
         }
@@ -625,34 +410,318 @@ QUERY;
         $oldIdentifier = $usid->getClass().'-'.$oldUsername;
         $newIdentifier = $usid->getClass().'-'.$usid->getUsername();
 
-        return sprintf(
-            'UPDATE %s SET identifier = %s WHERE identifier = %s AND username = %s',
-            $this->options['sid_table_name'],
-            $this->connection->quote($newIdentifier),
-            $this->connection->quote($oldIdentifier),
-            $this->connection->getDatabasePlatform()->convertBooleans(true)
-        );
+        $statement = $this->getUpdateUserSecurityIdentitySql();
+        $statement->bindValue(':identifier', $newIdentifier);
+        $statement->bindValue(':existing_identifier', $oldIdentifier);
+        $statement->bindValue(':username', true, ParameterType::BOOLEAN);
+        $statement->executeStatement();
+    }
+
+    /**
+     * Constructs the SQL for deleting access control entries.
+     */
+    protected function getDeleteAccessControlEntriesSql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->delete($this->options['entry_table_name'])
+            ->where($queryBuilder->expr()->eq('object_identity_id', ':object_identity_id'))
+        ;
+
+        return $this->connection->prepare($queryBuilder->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for deleting a specific ACE.
+     */
+    protected function getDeleteAccessControlEntrySql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->delete($this->options['entry_table_name'])
+            ->where($queryBuilder->expr()->eq('id', ':id'))
+        ;
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for deleting an object identity.
+     */
+    protected function getDeleteObjectIdentitySql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->delete($this->options['oid_table_name'])
+            ->where($queryBuilder->expr()->eq('id', ':id'))
+        ;
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for deleting relation entries.
+     */
+    protected function getDeleteObjectIdentityRelationsSql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->delete($this->options['oid_ancestors_table_name'])
+            ->where($queryBuilder->expr()->eq('object_identity_id', ':object_identity_id'))
+        ;
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for inserting an ACE.
+     */
+    protected function getInsertAccessControlEntrySql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->insert($this->options['entry_table_name'])
+            ->values([
+                'class_id' => ':class_id',
+                'object_identity_id' => ':object_identity_id',
+                'field_name' => ':field_name',
+                'ace_order' => ':ace_order',
+                'security_identity_id' => ':security_identity_id',
+                'mask' => ':mask',
+                'granting' => ':granting',
+                'granting_strategy' => ':granting_strategy',
+                'audit_success' => ':audit_success',
+                'audit_failure' => ':audit_failure',
+            ]);
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for inserting a new class type.
+     */
+    protected function getInsertClassSql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->insert($this->options['class_table_name'])
+            ->values(['class_type' => ':class_type']);
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for inserting a relation entry.
+     */
+    protected function getInsertObjectIdentityRelationSql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->insert($this->options['oid_ancestors_table_name'])
+            ->values([
+                'object_identity_id' => ':object_identity_id',
+                'ancestor_id' => ':ancestor_id',
+            ]);
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for inserting an object identity.
+     */
+    protected function getInsertObjectIdentitySql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->insert($this->options['oid_table_name'])
+            ->values([
+                'class_id' => ':class_id',
+                'object_identifier' => ':object_identifier',
+                'entries_inheriting' => ':entries_inheriting',
+            ]);
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for inserting a security identity.
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function getInsertSecurityIdentitySql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->insert($this->options['sid_table_name'])
+            ->values([
+                'identifier' => ':identifier',
+                'username' => ':username',
+            ])
+        ;
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for selecting an ACE.
+     */
+    protected function getSelectAccessControlEntryIdSql(?int $oid, ?string $field): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->select('id')
+            ->from($this->options['entry_table_name'])
+            ->where($queryBuilder->expr()->eq('class_id', ':class_id'))
+            ->andWhere(
+                null === $oid
+                ? $queryBuilder->expr()->isNull('object_identity_id')
+                : $queryBuilder->expr()->eq('object_identity_id', ':object_identity_id')
+            )
+            ->andWhere(
+                null === $field
+                    ? $queryBuilder->expr()->isNull('field_name')
+                    : $queryBuilder->expr()->eq('field_name', ':field_name')
+            )
+            ->andWhere($queryBuilder->expr()->eq('ace_order', ':ace_order'))
+        ;
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for selecting the primary key associated with
+     * the passed class type.
+     */
+    protected function getSelectClassIdSql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->select('id')
+            ->from($this->options['class_table_name'])
+            ->where($queryBuilder->expr()->eq('class_type', ':class_type'))
+        ;
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for selecting the primary key of a security identity.
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function getSelectSecurityIdentityIdSql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->select('id')
+            ->from($this->options['sid_table_name'])
+            ->where($queryBuilder->expr()->eq('identifier', ':identifier'))
+            ->andWhere($queryBuilder->expr()->eq('username', ':username'))
+        ;
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL to delete a security identity.
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function getDeleteSecurityIdentityIdSql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->delete($this->options['sid_table_name'])
+            ->where($queryBuilder->expr()->eq('identifier', ':identifier'))
+            ->andWhere($queryBuilder->expr()->eq('username', ':username'))
+        ;
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for updating an object identity.
+     *
+     * @param string[] $keys
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function getUpdateObjectIdentitySql(array $keys): Statement
+    {
+        if (0 === \count($keys)) {
+            throw new \InvalidArgumentException('There are no changes.');
+        }
+
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->update($this->options['oid_table_name'])
+            ->where(
+                $queryBuilder->expr()->eq('id', ':id')
+            )
+        ;
+
+        foreach ($keys as $key) {
+            $query->set($key, ':'.$key);
+        }
+
+        return $this->connection->prepare($query->getSQL());
+    }
+
+    /**
+     * Constructs the SQL for updating a user security identity.
+     */
+    protected function getUpdateUserSecurityIdentitySql(): Statement
+    {
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->update($this->options['sid_table_name'])
+            ->set('identifier', ':identifier')
+            ->where($queryBuilder->expr()->eq('identifier', ':existing_identifier'))
+            ->andWhere($queryBuilder->expr()->eq('username', ':username'))
+        ;
+
+        return $this->connection->prepare($query->getSQL());
     }
 
     /**
      * Constructs the SQL for updating an ACE.
      *
-     * @param array<int,string> $sets
+     * @param string[] $sets
      *
      * @throws \InvalidArgumentException
      */
-    protected function getUpdateAccessControlEntrySql(int $pk, array $sets): string
+    protected function getUpdateAccessControlEntrySql(array $keys): Statement
     {
-        if (0 === \count($sets)) {
+        if (0 === \count($keys)) {
             throw new \InvalidArgumentException('There are no changes.');
         }
 
-        return sprintf(
-            'UPDATE %s SET %s WHERE id = %d',
-            $this->options['entry_table_name'],
-            implode(', ', $sets),
-            $pk
-        );
+        $queryBuilder = $this->connection->createQueryBuilder();
+
+        $query = $queryBuilder
+            ->update($this->options['entry_table_name'])
+            ->where($queryBuilder->expr()->eq('id', ':id'));
+
+        foreach ($keys as $key) {
+            $query->set($key, ':'.$key);
+        }
+
+        return $this->connection->prepare($query->getSQL());
     }
 
     /**
@@ -662,7 +731,11 @@ QUERY;
     {
         $classId = $this->createOrRetrieveClassId($oid->getType());
 
-        $this->connection->executeStatement($this->getInsertObjectIdentitySql($oid->getIdentifier(), $classId, true));
+        $statement = $this->getInsertObjectIdentitySql();
+        $statement->bindValue(':class_id', $classId, ParameterType::INTEGER);
+        $statement->bindValue(':object_identifier', $oid->getIdentifier());
+        $statement->bindValue(':entries_inheriting', true, ParameterType::BOOLEAN);
+        $statement->executeStatement();
     }
 
     /**
@@ -672,13 +745,18 @@ QUERY;
      */
     private function createOrRetrieveClassId(string $classType): int
     {
-        if (false !== $id = $this->connection->executeQuery($this->getSelectClassIdSql($classType))->fetchOne()) {
+        $selectStatement = $this->getSelectClassIdSql();
+        $selectStatement->bindValue(':class_type', $classType);
+
+        if (false !== $id = $selectStatement->executeQuery()->fetchOne()) {
             return $id;
         }
 
-        $this->connection->executeStatement($this->getInsertClassSql($classType));
+        $statement = $this->getInsertClassSql();
+        $statement->bindValue(':class_type', $classType);
+        $statement->executeStatement();
 
-        return $this->connection->executeQuery($this->getSelectClassIdSql($classType))->fetchOne();
+        return $selectStatement->executeQuery()->fetchOne();
     }
 
     /**
@@ -689,13 +767,30 @@ QUERY;
      */
     private function createOrRetrieveSecurityIdentityId(SecurityIdentityInterface $sid): int
     {
-        if (false !== $id = $this->connection->executeQuery($this->getSelectSecurityIdentityIdSql($sid))->fetchOne()) {
+        if ($sid instanceof UserSecurityIdentity) {
+            $identifier = $sid->getClass().'-'.$sid->getUsername();
+            $username = true;
+        } elseif ($sid instanceof RoleSecurityIdentity) {
+            $identifier = $sid->getRole();
+            $username = false;
+        } else {
+            throw new \InvalidArgumentException('$sid must either be an instance of UserSecurityIdentity, or RoleSecurityIdentity.');
+        }
+
+        $selectSecurityIdentityIdStatement = $this->getSelectSecurityIdentityIdSql();
+        $selectSecurityIdentityIdStatement->bindValue(':identifier', $identifier);
+        $selectSecurityIdentityIdStatement->bindValue(':username', $username, ParameterType::BOOLEAN);
+
+        if (false !== $id = $selectSecurityIdentityIdStatement->executeQuery()->fetchOne()) {
             return $id;
         }
 
-        $this->connection->executeStatement($this->getInsertSecurityIdentitySql($sid));
+        $statement = $this->getInsertSecurityIdentitySql();
+        $statement->bindValue(':identifier', $identifier);
+        $statement->bindValue(':username', $username, ParameterType::BOOLEAN);
+        $statement->executeStatement();
 
-        return $this->connection->executeQuery($this->getSelectSecurityIdentityIdSql($sid))->fetchOne();
+        return $selectSecurityIdentityIdStatement->executeQuery()->fetchOne();
     }
 
     /**
@@ -703,7 +798,9 @@ QUERY;
      */
     private function deleteAccessControlEntries(int $oidPK): void
     {
-        $this->connection->executeStatement($this->getDeleteAccessControlEntriesSql($oidPK));
+        $statement = $this->getDeleteAccessControlEntriesSql();
+        $statement->bindValue('object_identity_id', $oidPK);
+        $statement->executeStatement();
     }
 
     /**
@@ -711,7 +808,9 @@ QUERY;
      */
     private function deleteObjectIdentity(int $pk): void
     {
-        $this->connection->executeStatement($this->getDeleteObjectIdentitySql($pk));
+        $statement = $this->getDeleteObjectIdentitySql();
+        $statement->bindValue('id', $pk);
+        $statement->executeStatement();
     }
 
     /**
@@ -719,7 +818,9 @@ QUERY;
      */
     private function deleteObjectIdentityRelations(int $pk): void
     {
-        $this->connection->executeStatement($this->getDeleteObjectIdentityRelationsSql($pk));
+        $statement = $this->getDeleteObjectIdentityRelationsSql();
+        $statement->bindValue('object_identity_id', $pk);
+        $statement->executeStatement();
     }
 
     /**
@@ -728,12 +829,18 @@ QUERY;
     private function regenerateAncestorRelations(AclInterface $acl): void
     {
         $pk = $acl->getId();
-        $this->connection->executeStatement($this->getDeleteObjectIdentityRelationsSql($pk));
-        $this->connection->executeStatement($this->getInsertObjectIdentityRelationSql($pk, $pk));
+        $this->deleteObjectIdentityRelations($pk);
+
+        $statement = $this->getInsertObjectIdentityRelationSql();
+        $statement->bindValue(':object_identity_id', $pk, ParameterType::INTEGER);
+        $statement->bindValue(':ancestor_id', $pk, ParameterType::INTEGER);
+        $statement->executeStatement();
 
         $parentAcl = $acl->getParentAcl();
         while (null !== $parentAcl) {
-            $this->connection->executeStatement($this->getInsertObjectIdentityRelationSql($pk, $parentAcl->getId()));
+            $statement->bindValue(':object_identity_id', $pk, ParameterType::INTEGER);
+            $statement->bindValue(':ancestor_id', $parentAcl->getId(), ParameterType::INTEGER);
+            $statement->executeStatement();
 
             $parentAcl = $parentAcl->getParentAcl();
         }
@@ -768,8 +875,33 @@ QUERY;
 
                     $objectIdentityId = 'classFieldAces' === $name ? null : $ace->getAcl()->getId();
 
-                    $this->connection->executeStatement($this->getInsertAccessControlEntrySql($classId, $objectIdentityId, $field, $i, $sid, $ace->getStrategy(), $ace->getMask(), $ace->isGranting(), $ace->isAuditSuccess(), $ace->isAuditFailure()));
-                    $aceId = $this->connection->executeQuery($this->getSelectAccessControlEntryIdSql($classId, $objectIdentityId, $field, $i))->fetchOne();
+                    $insertAccessControlEntryStatement = $this->getInsertAccessControlEntrySql();
+                    $insertAccessControlEntryStatement->bindValue(':class_id', $classId, ParameterType::INTEGER);
+                    $insertAccessControlEntryStatement->bindValue(':object_identity_id', $objectIdentityId, null === $objectIdentityId ? ParameterType::NULL : ParameterType::INTEGER);
+                    $insertAccessControlEntryStatement->bindValue(':field_name', $field, null === $field ? ParameterType::NULL : ParameterType::STRING);
+                    $insertAccessControlEntryStatement->bindValue(':ace_order', $i, ParameterType::INTEGER);
+                    $insertAccessControlEntryStatement->bindValue(':security_identity_id', $sid, ParameterType::INTEGER);
+                    $insertAccessControlEntryStatement->bindValue(':mask', $ace->getMask(), ParameterType::INTEGER);
+                    $insertAccessControlEntryStatement->bindValue(':granting', $ace->isGranting(), ParameterType::BOOLEAN);
+                    $insertAccessControlEntryStatement->bindValue(':granting_strategy', $ace->getStrategy());
+                    $insertAccessControlEntryStatement->bindValue(':audit_success', $ace->isAuditSuccess(), ParameterType::BOOLEAN);
+                    $insertAccessControlEntryStatement->bindValue(':audit_failure', $ace->isAuditFailure(), ParameterType::BOOLEAN);
+                    $insertAccessControlEntryStatement->executeStatement();
+
+                    $selectAccessControlEntryIdStatement = $this->getSelectAccessControlEntryIdSql($objectIdentityId, $field);
+                    $selectAccessControlEntryIdStatement->bindValue(':class_id', $classId);
+                    $selectAccessControlEntryIdStatement->bindValue(':ace_order', $i);
+
+                    if (\is_int($objectIdentityId)) {
+                        $selectAccessControlEntryIdStatement->bindValue(':object_identity_id', $objectIdentityId, ParameterType::INTEGER);
+                    }
+
+                    if (\is_string($field)) {
+                        $selectAccessControlEntryIdStatement->bindValue(':field_name', $field);
+                    }
+
+                    $aceId = $selectAccessControlEntryIdStatement->executeQuery()->fetchOne();
+
                     $this->loadedAces[$aceId] = $ace;
 
                     $aceIdProperty = new \ReflectionProperty(Entry::class, 'id');
@@ -803,7 +935,10 @@ QUERY;
                 $ace = $old[$i];
 
                 if (!isset($currentIds[$ace->getId()])) {
-                    $this->connection->executeStatement($this->getDeleteAccessControlEntrySql($ace->getId()));
+                    $statement = $this->getDeleteAccessControlEntrySql();
+                    $statement->bindValue('id', $ace->getId(), ParameterType::INTEGER);
+                    $statement->executeStatement();
+
                     unset($this->loadedAces[$ace->getId()]);
                 }
             }
@@ -840,8 +975,29 @@ QUERY;
 
                 $objectIdentityId = 'classAces' === $name ? null : $ace->getAcl()->getId();
 
-                $this->connection->executeStatement($this->getInsertAccessControlEntrySql($classId, $objectIdentityId, null, $i, $sid, $ace->getStrategy(), $ace->getMask(), $ace->isGranting(), $ace->isAuditSuccess(), $ace->isAuditFailure()));
-                $aceId = $this->connection->executeQuery($this->getSelectAccessControlEntryIdSql($classId, $objectIdentityId, null, $i))->fetchOne();
+                $statement = $this->getInsertAccessControlEntrySql();
+                $statement->bindValue(':class_id', $classId, ParameterType::INTEGER);
+                $statement->bindValue(':object_identity_id', $objectIdentityId, null === $objectIdentityId ? ParameterType::NULL : ParameterType::INTEGER);
+                $statement->bindValue(':field_name', null, ParameterType::NULL);
+                $statement->bindValue(':ace_order', $i, ParameterType::INTEGER);
+                $statement->bindValue(':security_identity_id', $sid, ParameterType::INTEGER);
+                $statement->bindValue(':mask', $ace->getMask(), ParameterType::INTEGER);
+                $statement->bindValue(':granting', $ace->isGranting(), ParameterType::BOOLEAN);
+                $statement->bindValue(':granting_strategy', $ace->getStrategy());
+                $statement->bindValue(':audit_success', $ace->isAuditSuccess(), ParameterType::BOOLEAN);
+                $statement->bindValue(':audit_failure', $ace->isAuditFailure(), ParameterType::BOOLEAN);
+                $statement->executeStatement();
+
+                $selectAccessControlEntryIdStatement = $this->getSelectAccessControlEntryIdSql($objectIdentityId, null);
+                $selectAccessControlEntryIdStatement->bindValue(':class_id', $classId);
+                $selectAccessControlEntryIdStatement->bindValue(':ace_order', $i);
+
+                if (\is_int($objectIdentityId)) {
+                    $selectAccessControlEntryIdStatement->bindValue(':object_identity_id', $objectIdentityId, ParameterType::INTEGER);
+                }
+
+                $aceId = $selectAccessControlEntryIdStatement->executeQuery()->fetchOne();
+
                 $this->loadedAces[$aceId] = $ace;
 
                 $aceIdProperty = new \ReflectionProperty($ace, 'id');
@@ -873,7 +1029,10 @@ QUERY;
             $ace = $old[$i];
 
             if (!isset($currentIds[$ace->getId()])) {
-                $this->connection->executeStatement($this->getDeleteAccessControlEntrySql($ace->getId()));
+                $statement = $this->getDeleteAccessControlEntrySql();
+                $statement->bindValue('id', $ace->getId(), ParameterType::INTEGER);
+                $statement->executeStatement();
+
                 unset($this->loadedAces[$ace->getId()]);
             }
         }
@@ -909,21 +1068,28 @@ QUERY;
         }
 
         if (isset($propertyChanges['mask'])) {
-            $sets[] = sprintf('mask = %d', $propertyChanges['mask'][1]);
+            $sets[] = ['key' => 'mask', 'value' => $propertyChanges['mask'][1], 'type' => ParameterType::INTEGER];
         }
         if (isset($propertyChanges['strategy'])) {
-            $sets[] = sprintf('granting_strategy = %s', $this->connection->quote($propertyChanges['strategy']));
+            $sets[] = ['key' => 'strategy', 'value' => $propertyChanges['strategy'][1], 'type' => ParameterType::STRING];
         }
         if (isset($propertyChanges['aceOrder'])) {
-            $sets[] = sprintf('ace_order = %d', $propertyChanges['aceOrder'][1]);
+            $sets[] = ['key' => 'ace_order', 'value' => $propertyChanges['aceOrder'][1], 'type' => ParameterType::INTEGER];
         }
         if (isset($propertyChanges['auditSuccess'])) {
-            $sets[] = sprintf('audit_success = %s', $this->connection->getDatabasePlatform()->convertBooleans($propertyChanges['auditSuccess'][1]));
+            $sets[] = ['key' => 'audit_success', 'value' => $propertyChanges['auditSuccess'][1], 'type' => ParameterType::BOOLEAN];
         }
         if (isset($propertyChanges['auditFailure'])) {
-            $sets[] = sprintf('audit_failure = %s', $this->connection->getDatabasePlatform()->convertBooleans($propertyChanges['auditFailure'][1]));
+            $sets[] = ['key' => 'audit_failure', 'value' => $propertyChanges['auditFailure'][1], 'type' => ParameterType::BOOLEAN];
         }
 
-        $this->connection->executeStatement($this->getUpdateAccessControlEntrySql($ace->getId(), $sets));
+        $statement = $this->getUpdateAccessControlEntrySql(array_column($sets, 'key'));
+        $statement->bindValue(':id', $ace->getId(), ParameterType::INTEGER);
+
+        foreach ($sets as $set) {
+            $statement->bindValue(':'.$set['key'], $set['value'], $set['type']);
+        }
+
+        $statement->executeStatement();
     }
 }

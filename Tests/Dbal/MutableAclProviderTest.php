@@ -16,6 +16,7 @@ namespace Symfony\Component\Security\Acl\Tests\Dbal;
 use Doctrine\DBAL\Configuration;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\DriverManager;
+use Doctrine\DBAL\ParameterType;
 use Doctrine\DBAL\Schema\DefaultSchemaManagerFactory;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Security\Acl\Dbal\AclProvider;
@@ -472,6 +473,10 @@ class MutableAclProviderTest extends TestCase
         $aclIds = $parentAcls = [];
         $con = $this->getField($provider, 'connection');
         $con->beginTransaction();
+
+        /** @var Statement $insertObjectIdentityRelationStatement */
+        $insertObjectIdentityRelationStatement = $this->callMethod($provider, 'getInsertObjectIdentityRelationSql', []);
+
         try {
             foreach ($data as $name => $aclData) {
                 if (!isset($aclData['object_identifier'], $aclData['class_type'])) {
@@ -482,13 +487,17 @@ class MutableAclProviderTest extends TestCase
                 $aclId = $con->lastInsertId();
                 $aclIds[$name] = $aclId;
 
-                $sql = $this->callMethod($provider, 'getInsertObjectIdentityRelationSql', [$aclId, $aclId]);
-                $con->executeStatement($sql);
+                $insertObjectIdentityRelationStatement->bindValue(':object_identity_id', $aclId, ParameterType::INTEGER);
+                $insertObjectIdentityRelationStatement->bindValue(':ancestor_id', $aclId, ParameterType::INTEGER);
+                $insertObjectIdentityRelationStatement->executeStatement();
 
                 if (isset($aclData['parent_acl'])) {
                     if (isset($aclIds[$aclData['parent_acl']])) {
                         $con->executeStatement('UPDATE acl_object_identities SET parent_object_identity_id = '.$aclIds[$aclData['parent_acl']].' WHERE id = '.$aclId);
-                        $con->executeStatement($this->callMethod($provider, 'getInsertObjectIdentityRelationSql', [$aclId, $aclIds[$aclData['parent_acl']]]));
+
+                        $insertObjectIdentityRelationStatement->bindValue(':object_identity_id', $aclId, ParameterType::INTEGER);
+                        $insertObjectIdentityRelationStatement->bindValue(':ancestor_id', $aclIds[$aclData['parent_acl']], ParameterType::INTEGER);
+                        $insertObjectIdentityRelationStatement->executeStatement();
                     } else {
                         $parentAcls[$aclId] = $aclData['parent_acl'];
                     }
@@ -501,7 +510,10 @@ class MutableAclProviderTest extends TestCase
                 }
 
                 $con->executeStatement(sprintf('UPDATE acl_object_identities SET parent_object_identity_id = %d WHERE id = %d', $aclIds[$name], $aclId));
-                $con->executeStatement($this->callMethod($provider, 'getInsertObjectIdentityRelationSql', [$aclId, $aclIds[$name]]));
+
+                $insertObjectIdentityRelationStatement->bindValue(':object_identity_id', $aclId, ParameterType::INTEGER);
+                $insertObjectIdentityRelationStatement->bindValue(':ancestor_id', $aclIds[$name], ParameterType::INTEGER);
+                $insertObjectIdentityRelationStatement->executeStatement();
             }
 
             $con->commit();
